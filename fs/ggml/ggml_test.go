@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+
+	"github.com/ollama/ollama/ml"
 )
 
 func TestTensorLayers(t *testing.T) {
@@ -297,5 +299,118 @@ func TestHeadCount(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("unexpected max value: got=%d want=%d", got, tt.want)
 		}
+	}
+}
+
+func TestGraphSizeHybridArchitecture(t *testing.T) {
+	// Test that hybrid Mamba+Attention architectures handle scalar head_count_kv
+	// correctly when full_attention_interval is present in GGUF metadata.
+	//
+	// When head_count_kv is stored as a scalar (common in third-party GGUF files),
+	// the scalar fallback broadcasts the value to ALL layers. With full_attention_interval
+	// set, the correction code should zero out non-attention layers.
+
+	vocabSize := 1000
+
+	baseKV := func() KV {
+		return KV{
+			"general.architecture":           "qwen35",
+			"qwen35.block_count":             uint32(8),
+			"qwen35.embedding_length":        uint32(5120),
+			"qwen35.attention.key_length":    uint32(256),
+			"qwen35.attention.value_length":  uint32(256),
+			"qwen35.ssm.conv_kernel":         uint32(4),
+			"qwen35.ssm.state_size":          uint32(128),
+			"qwen35.ssm.inner_size":          uint32(6144),
+			"qwen35.ssm.group_count":         uint32(16),
+			"tokenizer.ggml.tokens":          &array[string]{size: vocabSize},
+		}
+	}
+
+	cases := []struct {
+		name           string
+		kv             KV
+		wantAttnLayers []int
+	}{
+		{
+			name: "scalar head_count_kv with full_attention_interval",
+			kv: func() KV {
+				kv := baseKV()
+				kv["qwen35.attention.head_count"] = uint32(24)
+				kv["qwen35.attention.head_count_kv"] = uint32(4)
+				kv["qwen35.full_attention_interval"] = uint32(4)
+				return kv
+			}(),
+			wantAttnLayers: []int{3, 7},
+		},
+		{
+			name: "array head_count_kv already correct",
+			kv: func() KV {
+				kv := baseKV()
+				kv["qwen35.attention.head_count"] = &array[uint32]{values: []uint32{0, 0, 0, 24, 0, 0, 0, 24}, size: 8}
+				kv["qwen35.attention.head_count_kv"] = &array[uint32]{values: []uint32{0, 0, 0, 4, 0, 0, 0, 4}, size: 8}
+				kv["qwen35.full_attention_interval"] = uint32(4)
+				return kv
+			}(),
+			wantAttnLayers: []int{3, 7},
+		},
+		{
+			name: "scalar head_count_kv without full_attention_interval preserves existing behavior",
+			kv: func() KV {
+				kv := baseKV()
+				kv["general.architecture"] = "qwen2"
+				kv["qwen2.block_count"] = uint32(8)
+				kv["qwen2.embedding_length"] = uint32(5120)
+				kv["qwen2.attention.head_count"] = uint32(24)
+				kv["qwen2.attention.head_count_kv"] = uint32(4)
+				kv["qwen2.attention.key_length"] = uint32(256)
+				kv["qwen2.attention.value_length"] = uint32(256)
+				return kv
+			}(),
+			wantAttnLayers: []int{0, 1, 2, 3, 4, 5, 6, 7}, // all layers are attention
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testModel := &gguf{kv: tc.kv}
+			g := GGML{model: testModel}
+
+			kv, partialOffload, _ := g.GraphSize(8192, 512, 1, "f16", ml.FlashAttentionEnabled)
+
+			blockCount := int(tc.kv.BlockCount())
+			if len(kv) != blockCount {
+				t.Fatalf("expected %d kv entries, got %d", blockCount, len(kv))
+			}
+
+			attnSet := make(map[int]bool)
+			for _, idx := range tc.wantAttnLayers {
+				attnSet[idx] = true
+			}
+
+			// Get a reference attention KV size for comparison
+			var attnKVSize uint64
+			if len(tc.wantAttnLayers) > 0 {
+				attnKVSize = kv[tc.wantAttnLayers[0]]
+			}
+
+			for i := 0; i < blockCount; i++ {
+				if attnSet[i] {
+					if kv[i] == 0 {
+						t.Errorf("layer %d (attention): expected non-zero kv cache, got 0", i)
+					}
+				} else {
+					// Non-attention layers should have much smaller cache (SSM state)
+					// than attention layers. For these params, attention ~32 MiB, SSM ~3 MiB.
+					if attnKVSize > 0 && kv[i] >= attnKVSize {
+						t.Errorf("layer %d (mamba): kv cache %d should be less than attention kv %d", i, kv[i], attnKVSize)
+					}
+				}
+			}
+
+			if partialOffload == 0 {
+				t.Error("expected non-zero partialOffload")
+			}
+		})
 	}
 }

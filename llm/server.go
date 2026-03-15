@@ -594,7 +594,7 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 	}
 
 	if graphPartialOffload == 0 {
-		headsKV := s.ggml.KV().HeadCountKVMin()
+		headsKV := s.ggml.KV().HeadCountKVMax()
 		if headsKV == 0 {
 			headsKV = 1
 		}

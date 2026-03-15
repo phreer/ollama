@@ -613,6 +613,28 @@ func (f GGML) GraphSize(context, batch uint64, numParallel int, kvCacheType stri
 
 	bytesPerElement := kvCacheBytesPerElement(kvCacheType)
 
+	// Correct head count arrays for hybrid architectures (e.g., Mamba+Attention)
+	// where GGUF stores head counts as scalars. When full_attention_interval is
+	// set, only every Nth layer is an attention layer; other layers are recurrent
+	// and should have 0 attention heads.
+	if fai := f.KV().Uint("full_attention_interval"); fai > 0 && len(headsKVArr) > 1 {
+		allEqual := true
+		for i := 1; i < len(headsKVArr); i++ {
+			if headsKVArr[i] != headsKVArr[0] {
+				allEqual = false
+				break
+			}
+		}
+		if allEqual && headsKVArr[0] > 0 {
+			for i := range headsKVArr {
+				if (i+1)%int(fai) != 0 {
+					headsKVArr[i] = 0
+					headsArr[i] = 0
+				}
+			}
+		}
+	}
+
 	// Default for models unless special-cased below. These defaults mirror the
 	// cache usage in llama.cpp under the assumption that models without special
 	// cases below will use the llamarunner and caching will be handled by the
@@ -836,6 +858,12 @@ func (f GGML) GraphSize(context, batch uint64, numParallel int, kvCacheType stri
 		}
 
 		partialOffload = 2 * f.KV().HeadCountMax() / cmp.Or(f.KV().HeadCountKVMin(), 1) * kvTotal / 6
+		if useFlashAttention == ml.FlashAttentionEnabled {
+			// rough estimate of graph size with flash attention on
+			partialOffload = (4*uint64(numParallel) + context>>10 + 110) * format.MebiByte
+		}
+	case "qwen35", "qwen3next":
+		partialOffload = 2 * f.KV().HeadCountMax() / cmp.Or(f.KV().HeadCountKVMax(), 1) * kvTotal / 6
 		if useFlashAttention == ml.FlashAttentionEnabled {
 			// rough estimate of graph size with flash attention on
 			partialOffload = (4*uint64(numParallel) + context>>10 + 110) * format.MebiByte
