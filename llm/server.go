@@ -30,6 +30,7 @@ import (
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/fs/ggml"
+	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/llama"
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/ml"
@@ -171,7 +172,7 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 
 	opts.NumBatch = min(opts.NumBatch, opts.NumCtx)
 
-	loadRequest := LoadRequest{LoraPath: adapters, KvSize: opts.NumCtx * numParallel, BatchSize: opts.NumBatch, Parallel: numParallel, MultiUserCache: envconfig.MultiUserCache()}
+	loadRequest := LoadRequest{LoraPath: adapters, KvSize: opts.NumCtx * numParallel, BatchSize: opts.NumBatch, Parallel: numParallel, MultiUserCache: envconfig.MultiUserCache(), CheckpointCount: -1}
 
 	defaultThreads := systemInfo.ThreadCount
 	if opts.NumThread > 0 {
@@ -479,6 +480,12 @@ type LoadRequest struct {
 	NumThreads     int
 	GPULayers      ml.GPULayersList
 	MultiUserCache bool
+
+	// CheckpointCount controls the number of recurrent-state checkpoints
+	// stored on the GPU. -1 means use the default (24). Lower values
+	// reduce VRAM for hybrid Mamba+Attention models at the cost of
+	// slower prefix-reuse recovery in long conversations.
+	CheckpointCount int
 
 	// Legacy fields - not used with the Ollama engine
 	ProjectorPath string
@@ -858,6 +865,32 @@ nextOperation:
 				// If we generated a layout a second time or go backwards, then we've converged. Use the last
 				// layout before the repeat, which is already allocated.
 				if resp.Success {
+					// If not fully offloaded and checkpoints can still be reduced,
+					// try reducing them to see if more layers fit on the GPU.
+					// Reset back to the fit operation so the memory layout is
+					// re-evaluated with the new checkpoint count.
+					if gpuLayers.Sum() < int(s.totalLayers) && s.loadRequest.CheckpointCount != 0 {
+						prev := s.loadRequest.CheckpointCount
+						if prev < 0 {
+							s.loadRequest.CheckpointCount = kvcache.DefaultCheckpointCount / 2
+						} else {
+							s.loadRequest.CheckpointCount = prev / 2
+						}
+
+						slog.Info("converged with partial offload, reducing checkpoints to try fitting more layers",
+							"layers", gpuLayers.Sum(), "total", s.totalLayers,
+							"previous_checkpoints", prev, "new_checkpoints", s.loadRequest.CheckpointCount)
+
+						clear(pastAllocations)
+						s.mem = nil
+						gpuLayers, err = s.createLayout(systemInfo, gpus, s.mem, requireFull, backoff)
+						if err != nil {
+							return nil, err
+						}
+						operation = LoadOperationFit - 1 // will increment to Fit
+						continue nextOperation
+					}
+
 					continue nextOperation
 				}
 
@@ -866,9 +899,26 @@ nextOperation:
 				}
 
 				// Memory allocation failed even though we created a layout that we thought should
-				// fit in available memory. This could happen if either our free memory reports
-				// are incorrect or if available memory is changing between layout and allocation
-				// time. Apply a backoff to try to find the real amount of available space.
+				// fit in available memory. Before applying a backoff (which reduces GPU layers),
+				// try reducing recurrent checkpoint count first. Checkpoints consume significant
+				// VRAM for hybrid Mamba+Attention models but only affect prefix-reuse speed.
+				if s.loadRequest.CheckpointCount != 0 {
+					prev := s.loadRequest.CheckpointCount
+					if prev < 0 {
+						// First reduction: go from default (24) to half
+						s.loadRequest.CheckpointCount = kvcache.DefaultCheckpointCount / 2
+					} else {
+						s.loadRequest.CheckpointCount = prev / 2
+					}
+
+					slog.Info("reducing recurrent checkpoints to free VRAM",
+						"previous", prev, "new", s.loadRequest.CheckpointCount)
+
+					clear(pastAllocations)
+					continue nextLoad
+				}
+
+				// Checkpoints already at 0 — fall through to backoff on available memory.
 				if backoff > 1 {
 					slog.Warn("memory layout cannot be allocated", "memory", resp.Memory)
 					return nil, errors.New("memory layout cannot be allocated")

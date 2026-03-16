@@ -1181,6 +1181,7 @@ func (s *Server) allocModel(
 	kvCacheType string,
 	kvSize int,
 	multiUserCache bool,
+	checkpointCount int,
 ) (panicErr error) {
 	// Convert memory allocation panics to errors
 	defer func() {
@@ -1223,6 +1224,16 @@ func (s *Server) allocModel(
 	s.cache, err = NewInputCache(s.model, kvCacheType, int32(kvSize), parallel, s.batchSize, multiUserCache)
 	if err != nil {
 		return err
+	}
+
+	// Apply checkpoint count override for recurrent caches. A value of -1
+	// means use the default; 0 disables checkpoints entirely. Reducing
+	// checkpoints frees significant VRAM for hybrid Mamba+Attention models.
+	if checkpointCount >= 0 {
+		if cc, ok := s.model.Config().Cache.(interface{ SetCheckpointCount(int) }); ok {
+			slog.Info("overriding recurrent checkpoint count", "count", checkpointCount)
+			cc.SetCheckpointCount(checkpointCount)
+		}
 	}
 
 	s.parallel = parallel
@@ -1308,7 +1319,7 @@ func (s *Server) load(w http.ResponseWriter, r *http.Request) {
 
 		s.batchSize = req.BatchSize
 
-		err := s.allocModel(s.modelPath, params, req.LoraPath, req.Parallel, req.KvCacheType, req.KvSize, req.MultiUserCache)
+		err := s.allocModel(s.modelPath, params, req.LoraPath, req.Parallel, req.KvCacheType, req.KvSize, req.MultiUserCache, req.CheckpointCount)
 		if err != nil {
 			s.closeModel()
 

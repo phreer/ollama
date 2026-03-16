@@ -120,6 +120,22 @@ func NewRecurrentCache(config RecurrentConfig) *Recurrent {
 	}
 }
 
+// SetCheckpointCount overrides the number of recurrent-state checkpoints
+// retained on the GPU. Reducing this value frees significant VRAM for
+// hybrid Mamba+Attention models while only affecting prefix-reuse speed.
+// Must be called before Init.
+func (c *Recurrent) SetCheckpointCount(n int) {
+	if n < 0 {
+		n = 0
+	}
+	c.checkpointCount = n
+}
+
+// GetCheckpointCount returns the current checkpoint count setting.
+func (c *Recurrent) GetCheckpointCount() int {
+	return c.checkpointCount
+}
+
 func (c *Recurrent) Init(backend ml.Backend, dtype ml.DType, maxSequences, capacity, maxBatch int) {
 	c.backend = backend
 	c.dtype = dtype
